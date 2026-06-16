@@ -48,12 +48,16 @@ BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 // Command settings
 float target_angle = 0;
 float spring_constant = 0.3;
-float angle_error, angle_error1;
-float current_angle, current_angle1;
-float torque_input, torque_input1;
+float angle_error = 0;
+float angle_error1 = 0;
+float current_angle = 0;
+float current_angle1 = 0;
+float torque_input = 0;
+float torque_input1 = 0;
 float damping = 0.3;
-float damping1 = 0;
-float currVelocity, currVelocity1;
+float damping1 = 0.3;
+float currVelocity = 0;
+float currVelocity1 = 0;
 uint32_t prev_millis;
 
 // Setting the alarm voltage
@@ -75,6 +79,8 @@ void setup() {
   Serial.begin(115200);
   board_init();
 
+  delay(500);
+  
   I2Cone.begin(19, 18, 400000UL);  // AS5600_M0
   I2Ctwo.begin(23, 5, 400000UL);   // AS5600_M1
   sensor.init(&I2Cone);
