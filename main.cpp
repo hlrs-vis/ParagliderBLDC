@@ -15,7 +15,7 @@
 
 // Current implementation: Modelling the motors as springs with damping factor
 /*
-.ini platform note: use following versions
+.ini platform note: use following versions, but if 6.3.2 is giving i2cwritereadnonstop, try 5.0.0 
   [env:esp32dev]
   platform = espressif32@6.3.2
   board = esp32dev
