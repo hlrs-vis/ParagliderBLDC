@@ -29,8 +29,11 @@
 
 */
 
+#include <ESP32Encoder.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
+
+ESP32Encoder encoder;
 
 MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
 MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
@@ -57,8 +60,8 @@ float torque_input = 0;
 float torque_input1 = 0;
 float damping = 0.3;
 float damping1 = 0.01;
-float currVelocity = 0;
-float currVelocity1 = 0;
+float curr_Velocity = 0;
+float curr_Velocity1 = 0;
 uint32_t prev_millis;
 
 // Setting the alarm voltage
@@ -78,6 +81,15 @@ bool flag_under_voltage = false;
 
 void setup() {
   Serial.begin(115200);
+
+  // to attach 5V Vcc of encoder to 3V of esp32, turn on internal pull-up
+  // resistors
+  ESP32Encoder::useInternalWeakPullResistors = UP;
+
+  // attach encoder channels to pins
+  encoder.attachFullQuad(4, 15);
+
+  encoder.setCount(0);
 
   Serial.println("===== BOOT =====");
 
@@ -177,17 +189,18 @@ void loop() {
   // motor.loopFOC();
   motor1.loopFOC();
 
-  // Serial.print("Sensor angle: ");
-  // Serial.println(sensor.getAngle());
+  double encoderPosition = encoder.getCount();
+  if (encoderPosition < 0) {
+    Serial.println("Banking left");
+  } else {
+    Serial.println("Banking right");
+  }
 
-  // Serial.print("Sensor1 angle: ");
-  // Serial.println(sensor1.getAngle());
+  Serial.println("At ");
+  double bankingAngle = encoderPosition * (360.0 / (4.0 * 500.0));
+  Serial.println(bankingAngle);
 
-  // Serial.print("Motor voltage: ");
-  // Serial.println(driver.voltage_power_supply);
-
-  // Serial.print("Motor1 voltage: ");
-  // Serial.println(driver1.voltage_power_supply);
+  delay(200);
 
   // torque = spring constant * (target angle - current angle)
   // current_angle = sensor.getAngle();
@@ -196,11 +209,11 @@ void loop() {
   // angle_error = (target_angle - current_angle);
   angle_error1 = (target_angle - current_angle1);
 
-  // currVelocity = sensor.getVelocity();
-  currVelocity1 = sensor1.getVelocity();
+  // curr_Velocity = sensor.getVelocity();
+  curr_Velocity1 = sensor1.getVelocity();
 
-  // torque_input = spring_constant * angle_error - currVelocity * damping;
-  torque_input1 = spring_constant * angle_error1 - currVelocity1 * damping1;
+  // torque_input = spring_constant * angle_error - curr_Velocity * damping;
+  torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
 
   // instead of motor.move for motion control, need to generate PWM signals
   // motor.move(torque_input);
@@ -211,11 +224,6 @@ void loop() {
 
   // User Communications
   if (!flag_under_voltage) command.run();
-
-  // Serial.print(sensor.getAngle());
-  // Serial.print(" - ");
-  // Serial.print(sensor1.getAngle());
-  // Serial.println();
 }
 
 void board_init() {
