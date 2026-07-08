@@ -1,39 +1,14 @@
-// MKS ESP32 FOC V2.0 | Open Loop Position Example | Library:SimpleFOC 2.2.1 |
-// Hardware:MKS ESP32 FOC V2.0 & MKS AS5600
-
-// !!!Notice!!!
-// ①Enter "T+number" in the serial port to set the position of the two motors.
-// For example, if you want the motor to rotate to 180°, enter "T3.14" (180° in
-// radians) ②When using your own motor, be sure to modify the default number of
-// pole pairs, that is, the value in BLDCMotor(7), to the number of pole pairs
-// of your own motor. ③Please set the correct voltage_limit value according to
-// the selected motor. It is recommended to set it between 0.5 and 1.0 for the
-// aircraft model motor and below 4 for the gimbal motor. Excessive voltage and
-// current may burn out the driver board! ④The pid parameters of this routine
-// can control the 2808 model aircraft motor. If you want to achieve better
-// results or use other motors, please adjust the pid parameters yourself.
-
-// Current implementation: Modelling the motors as springs with damping factor
-/*
-.ini platform note: use following versions
-  [env:esp32dev]
-  platform = espressif32@6.3.2
-  board = esp32dev
-  framework = arduino
-  monitor_speed = 115200
-
-  lib_deps =
-      askuric/Simple FOC @ 2.2.1
-
-  upload_port = COM15
-
-*/
-
-#include <ESP32Encoder.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
+#include <ESP32Encoder.h>
 
-ESP32Encoder encoder;
+// actual wiring currently has PINB on IO4 and PINA on IO15
+#define PINA 15
+#define PINB 4
+#define PINI 2
+
+// encoder instantiation: pina, pinb, index?
+ESP32Encoder centreEncoder;
 
 MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
 MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
@@ -62,7 +37,7 @@ float damping = 0.3;
 float damping1 = 0.01;
 float curr_Velocity = 0;
 float curr_Velocity1 = 0;
-uint32_t prev_millis;
+uint32_t prev_millis_board;
 
 // Setting the alarm voltage
 #define UNDERVOLTAGE_THRES 11.1
@@ -82,18 +57,17 @@ bool flag_under_voltage = false;
 void setup() {
   Serial.begin(115200);
 
-  // to attach 5V Vcc of encoder to 3V of esp32, turn on internal pull-up
-  // resistors
-  ESP32Encoder::useInternalWeakPullResistors = UP;
-
-  // attach encoder channels to pins
-  encoder.attachFullQuad(4, 15);
-
-  encoder.setCount(0);
-
   Serial.println("===== BOOT =====");
 
   board_init();
+
+  pinMode(PINA, INPUT_PULLUP);
+  pinMode(PINB, INPUT_PULLUP);
+
+  //ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  centreEncoder.attachFullQuad(PINA, PINB);
+
+  centreEncoder.setCount(0);
 
   delay(500);
 
@@ -189,18 +163,10 @@ void loop() {
   // motor.loopFOC();
   motor1.loopFOC();
 
-  double encoderPosition = encoder.getCount();
-  if (encoderPosition < 0) {
-    Serial.println("Banking left");
-  } else {
-    Serial.println("Banking right");
-  }
-
-  Serial.println("At ");
-  double bankingAngle = encoderPosition * (360.0 / (4.0 * 500.0));
-  Serial.println(bankingAngle);
-
-  delay(200);
+  //return encoder every half second?
+    long count = centreEncoder.getCount();
+    Serial.print("Encoder Count: ");
+    Serial.println(count);
 
   // torque = spring constant * (target angle - current angle)
   // current_angle = sensor.getAngle();
@@ -253,7 +219,7 @@ void board_check() {
   uint32_t curr_millis = millis();
   static uint8_t enableState = 0;
 
-  if (curr_millis - prev_millis >= 1000) {
+  if (curr_millis - prev_millis_board >= 1000) {
     float vin_Volt = get_vin_Volt();
 
     if (vin_Volt < UNDERVOLTAGE_THRES) {
@@ -278,6 +244,6 @@ void board_check() {
       // motor.enable();
       motor1.enable();
     }
-    prev_millis = curr_millis;
+    prev_millis_board = curr_millis;
   }
 }
