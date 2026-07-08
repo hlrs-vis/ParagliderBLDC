@@ -114,26 +114,22 @@ void setup() {
   // motor.useMonitoring(Serial);
   motor1.useMonitoring(Serial);
 
-  // current_angle = sensor.getAngle();
-  current_angle1 = sensor1.getAngle();
-
-  // angle restricted 0 - 2pi
-  angle_error = (target_angle - current_angle1);
-  // torque_input = spring_constant * angle_error;
-  torque_input1 = spring_constant * angle_error;
+  //-------Torque Control and Variables Setup------
 
   // foc_current wont work bc rs2205 motor doesn't have current sensors
   // motor.torque_controller = TorqueControlType::voltage;
   motor1.torque_controller = TorqueControlType::voltage;
 
-  // Motion control mode settings
-  // motor.controller = MotionControlType::torque;
-  motor1.controller = MotionControlType::torque;
-
   // [V] Please modify and check this value carefully, excessive voltage
   // and current may cause the driver board to burn out!!!
   // motor.voltage_limit = 0.3;  // Maximum voltage [V]
   motor1.voltage_limit = 0.5;  // Maximum voltage [V]
+  motor1.current_limit = 1.0; //max current limit
+  motor1.phase_resistance = 0.5f;
+
+  //manually adjust PID values, but do we also need LPF?
+  motor1.PID_velocity.P = 0.5;
+  motor1.PID_velocity.I = 30.0;
 
   // Set a maximum speed limit
   // this is speed at which motor responds
@@ -156,35 +152,55 @@ void setup() {
   Serial.println(
       F("Set the target velocity, voltage, and virtual spring constant using "
         "serial terminal:"));
+
+  //-------Winding String Upon Startup--------
+  motor1.controller = MotionControlType::angle;
 }
 
 void loop() {
+  static bool windMotor = false;
+
+  static float zeroAngleAfterWinding;
   // polling continuously I2C encoders
   // motor.loopFOC();
   motor1.loopFOC();
-
-  //return encoder every half second?
-    long count = centreEncoder.getCount();
-    Serial.print("Encoder Count: ");
-    Serial.println(count);
 
   // torque = spring constant * (target angle - current angle)
   // current_angle = sensor.getAngle();
   current_angle1 = sensor1.getAngle();
 
-  // angle_error = (target_angle - current_angle);
-  angle_error1 = (target_angle - current_angle1);
-
   // curr_Velocity = sensor.getVelocity();
   curr_Velocity1 = sensor1.getVelocity();
 
-  // torque_input = spring_constant * angle_error - curr_Velocity * damping;
-  torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
+  //still need to wound, then wound
+  if(!windMotor){
+    float windUpRevolution = -44;
 
-  // instead of motor.move for motion control, need to generate PWM signals
-  // motor.move(torque_input);
-  motor1.move(torque_input1);
+    motor1.move(windUpRevolution);
+    if(fabs(current_angle1 - windUpRevolution) < 0.1){
+      windMotor = true;
+      zeroAngleAfterWinding = current_angle1;
+      motor1.controller = MotionControlType::torque;
+    }
+  }else{
+    current_angle1 = sensor1.getAngle();
+    // angle_error = (target_angle - current_angle);
+    angle_error1 = (zeroAngleAfterWinding - current_angle1);
+    curr_Velocity1 = sensor1.getVelocity();
 
+    
+    // torque_input = spring_constant * angle_error - curr_Velocity * damping;
+    torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
+    // instead of motor.move for motion control, need to generate PWM signals
+    // motor.move(torque_input);
+    motor1.move(torque_input1);
+  }
+
+  //----------Centre Encoder Readings----------
+  long count = centreEncoder.getCount();
+  Serial.print("Encoder Count: ");
+  Serial.println(count);
+  
   // When the voltage is lower than the set value, the motor will be disabled.
   board_check();
 
