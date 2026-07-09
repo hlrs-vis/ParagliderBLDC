@@ -1,6 +1,30 @@
+/* The platform.ini file that works with this code is as follows. If you get errors relating to needing updated versions,   
+delete the .pio folder and do a full clean. 
+
+[env:esp32dev]
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/51.03.04/platform-espressif32.zip
+board = esp32dev
+framework = arduino
+
+lib_deps =
+    askuric/Simple FOC @ 2.4.0
+    madhephaestus/ESP32Encoder @ ^0.11.7
+
+monitor_speed = 115200
+upload_port = COM17
+
+
+*/
+
+/* This current version has the wind spool on startup working properly even with the weight of the handle/string. 
+The spring does not work as it once did. It is significantly weaker and acts more like a yoyo than a spring.
+Current and voltage limits were increased for enough torque to wind up the spool, but estimated current mode isn't
+yielding the same magnitude of corrective torque as voltage mode
+
+  */
+#include <ESP32Encoder.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
-#include <ESP32Encoder.h>
 
 // actual wiring currently has PINB on IO4 and PINA on IO15
 #define PINA 15
@@ -26,7 +50,7 @@ BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 
 // Command settings
 float target_angle = 0;
-float spring_constant = 0.1;
+float spring_constant = 0.25;
 float angle_error = 0;
 float angle_error1 = 0;
 float current_angle = 0;
@@ -34,7 +58,7 @@ float current_angle1 = 0;
 float torque_input = 0;
 float torque_input1 = 0;
 float damping = 0.3;
-float damping1 = 0.01;
+float damping1 = 0.05;
 float curr_Velocity = 0;
 float curr_Velocity1 = 0;
 uint32_t prev_millis_board;
@@ -64,7 +88,7 @@ void setup() {
   pinMode(PINA, INPUT_PULLUP);
   pinMode(PINB, INPUT_PULLUP);
 
-  //ESP32Encoder::useInternalWeakPullResistors = puType::up;
+  // ESP32Encoder::useInternalWeakPullResistors = puType::up;
   centreEncoder.attachFullQuad(PINA, PINB);
 
   centreEncoder.setCount(0);
@@ -100,6 +124,8 @@ void setup() {
   // driver.init();
 
   driver1.voltage_power_supply = get_vin_Volt();
+  // driver1.pwm_frequency = 1000;  higher frequency eliminates noise
+  // apparently?
   driver1.init();
 
   // Connect the motor and driver objects
@@ -118,23 +144,24 @@ void setup() {
 
   // foc_current wont work bc rs2205 motor doesn't have current sensors
   // motor.torque_controller = TorqueControlType::voltage;
-  motor1.torque_controller = TorqueControlType::voltage;
+  motor1.torque_controller = TorqueControlType::estimated_current;
 
   // [V] Please modify and check this value carefully, excessive voltage
   // and current may cause the driver board to burn out!!!
   // motor.voltage_limit = 0.3;  // Maximum voltage [V]
-  motor1.voltage_limit = 0.5;  // Maximum voltage [V]
-  motor1.current_limit = 1.0; //max current limit
-  motor1.phase_resistance = 0.5f;
+  motor1.voltage_limit = 5.0;      // Maximum voltage [V]
+  motor1.updateCurrentLimit(4.5);  // max current limit
+  motor1.phase_resistance = 0.1f;
 
-  //manually adjust PID values, but do we also need LPF?
+  // manually adjust PID values, but do we also need LPF?
   motor1.PID_velocity.P = 0.5;
-  motor1.PID_velocity.I = 30.0;
+  motor1.PID_velocity.I = 4.0;
+  motor1.LPF_velocity.Tf = 0.01;
 
   // Set a maximum speed limit
   // this is speed at which motor responds
   // motor.velocity_limit = 10;
-  motor1.velocity_limit = 10;
+  motor1.velocity_limit = 2;
 
   // Initialize the motor
   // motor.init();
@@ -172,23 +199,22 @@ void loop() {
   // curr_Velocity = sensor.getVelocity();
   curr_Velocity1 = sensor1.getVelocity();
 
-  //still need to wound, then wound
-  if(!windMotor){
-    float windUpRevolution = -44;
+  // still need to wound, then wound
+  if (!windMotor) {
+    static float windUpRevolution = -48;
 
     motor1.move(windUpRevolution);
-    if(fabs(current_angle1 - windUpRevolution) < 0.1){
+    if (fabs(current_angle1 - windUpRevolution) < 0.1) {
       windMotor = true;
       zeroAngleAfterWinding = current_angle1;
       motor1.controller = MotionControlType::torque;
     }
-  }else{
+  } else {
     current_angle1 = sensor1.getAngle();
     // angle_error = (target_angle - current_angle);
     angle_error1 = (zeroAngleAfterWinding - current_angle1);
     curr_Velocity1 = sensor1.getVelocity();
 
-    
     // torque_input = spring_constant * angle_error - curr_Velocity * damping;
     torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
     // instead of motor.move for motion control, need to generate PWM signals
@@ -200,7 +226,7 @@ void loop() {
   long count = centreEncoder.getCount();
   Serial.print("Encoder Count: ");
   Serial.println(count);
-  
+
   // When the voltage is lower than the set value, the motor will be disabled.
   board_check();
 
