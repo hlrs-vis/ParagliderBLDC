@@ -45,9 +45,9 @@ void board_init();
 
 // Torque calculation variables
 float target_angle = 0;
-float spring_constant = 0.25;
+float spring_constant = 0.8;
 float damping = 0.3;
-float damping1 = 0.05;
+float damping1 = 0.3;
 float angle_error = 0;
 float angle_error1 = 0;
 float current_angle = 0;
@@ -160,12 +160,12 @@ void setup() {
   // [V] Please modify and check this value carefully, excessive voltage
   // and current may cause the driver board to burn out!!!
   // motor.voltage_limit = 0.3;  // Maximum voltage [V]
-  motor1.voltage_limit = 5.0;      // Maximum voltage [V]
-  motor1.updateCurrentLimit(4.5);  // max current limit
+  motor1.voltage_limit = 0.5;      // Maximum voltage [V]
+  motor1.updateCurrentLimit(1.0);  // max current limit
   motor1.phase_resistance = 0.1f;
 
   // motor.velocity_limit = 10;
-  motor1.velocity_limit = 2;
+  motor1.velocity_limit = 3;
 
   motor1.PID_velocity.P = 0.2;  // higher than 0.2 = vibrations
   motor1.PID_velocity.I = 0.5;
@@ -178,6 +178,9 @@ void setup() {
   // motor.initFOC();
   motor1.initFOC();
   delay(1000);
+
+  motor1.voltage_limit = 2.5;  // Maximum voltage [V]
+  motor1.updateCurrentLimit(2.5);
 
   // creating commands (command id, function pointer, command label)
   command.add('T', doTarget, "target angle");
@@ -206,12 +209,16 @@ void loop() {
   if (!windMotor) {
     motor1.move(windUpRad);
     if (fabs(current_angle1 - windUpRad) < 0.1) {
-      windMotor = true;
+      motor1.move(0);
+      delay(200);
+
       zeroAngleAfterWinding = current_angle1;
 
       // switch to torque mode now for "spring" behaviour
       motor1.PID_velocity.reset();
       motor1.controller = MotionControlType::torque;
+
+      windMotor = true;
     }
   } else {
     current_angle1 = sensor1.getAngle();
