@@ -1,8 +1,10 @@
-/* The platform.ini file that works with this code is as follows. If you get errors relating to needing updated versions,   
-delete the .pio folder and do a full clean. 
+/* The platform.ini file that works with this code is as follows. If you get
+errors relating to needing updated versions, delete the .pio folder and do a
+full clean.
 
 [env:esp32dev]
-platform = https://github.com/pioarduino/platform-espressif32/releases/download/51.03.04/platform-espressif32.zip
+platform =
+https://github.com/pioarduino/platform-espressif32/releases/download/51.03.04/platform-espressif32.zip
 board = esp32dev
 framework = arduino
 
@@ -16,12 +18,15 @@ upload_port = COM17
 
 */
 
-/* This current version has the wind spool on startup working properly even with the weight of the handle/string. 
-The spring does not work as it once did. It is significantly weaker and acts more like a yoyo than a spring.
-Current and voltage limits were increased for enough torque to wind up the spool, but estimated current mode isn't
-yielding the same magnitude of corrective torque as voltage mode
+/* This current version has the wind spool on startup working properly even with
+the weight of the handle/string. The spring does not work as it once did. It is
+significantly weaker and acts more like a yoyo than a spring. Current and
+voltage limits were increased for enough torque to wind up the spool, but
+estimated current mode isn't yielding the same magnitude of corrective torque as
+voltage mode
 
   */
+
 #include <ESP32Encoder.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
@@ -31,7 +36,37 @@ yielding the same magnitude of corrective torque as voltage mode
 #define PINB 4
 #define PINI 2
 
-// encoder instantiation: pina, pinb, index?
+// Setting the alarm voltage
+#define UNDERVOLTAGE_THRES 11.1
+
+void board_check();
+float get_vin_Volt();
+void board_init();
+
+// Torque calculation variables
+float target_angle = 0;
+float spring_constant = 0.25;
+float damping = 0.3;
+float damping1 = 0.05;
+float angle_error = 0;
+float angle_error1 = 0;
+float current_angle = 0;
+float current_angle1 = 0;
+float torque_input = 0;
+float torque_input1 = 0;
+float curr_Velocity = 0;
+float curr_Velocity1 = 0;
+
+// Wind spool on startup variables
+float zeroAngleAfterWinding = 0;
+float windUpRad = -48;
+bool windMotor = false;
+
+// Board safety check variables
+bool flag_under_voltage = false;
+uint32_t prev_millis_board;
+
+// Objects (encoder, sensors, motors, drivers)
 ESP32Encoder centreEncoder;
 
 MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
@@ -41,42 +76,16 @@ MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
 TwoWire I2Cone = TwoWire(0);
 TwoWire I2Ctwo = TwoWire(1);
 
-// Motor parameters
 BLDCMotor motor = BLDCMotor(7);
 BLDCDriver3PWM driver = BLDCDriver3PWM(32, 33, 25, 12);
 
 BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 
-// Command settings
-float target_angle = 0;
-float spring_constant = 0.25;
-float angle_error = 0;
-float angle_error1 = 0;
-float current_angle = 0;
-float current_angle1 = 0;
-float torque_input = 0;
-float torque_input1 = 0;
-float damping = 0.3;
-float damping1 = 0.05;
-float curr_Velocity = 0;
-float curr_Velocity1 = 0;
-uint32_t prev_millis_board;
-
-// Setting the alarm voltage
-#define UNDERVOLTAGE_THRES 11.1
-
 Commander command = Commander(Serial);
-
 void doTarget(char* cmd) { command.scalar(&target_angle, cmd); }
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
 void doSpring(char* cmd) { command.scalar(&spring_constant, cmd); }
-
-void board_check();
-float get_vin_Volt();
-void board_init();
-
-bool flag_under_voltage = false;
 
 void setup() {
   Serial.begin(115200);
@@ -96,7 +105,7 @@ void setup() {
   delay(500);
 
   // I2Cone.begin(19, 18, 400000UL);  // AS5600_M0
-  I2Ctwo.begin(23, 5, 400000UL);  // AS5600_M1
+  I2Ctwo.begin(23, 5, 100000UL);  // AS5600_M1
 
   Serial.println("Scanning...");
 
@@ -140,9 +149,11 @@ void setup() {
   // motor.useMonitoring(Serial);
   motor1.useMonitoring(Serial);
 
-  //-------Torque Control and Variables Setup------
+  //-------Torque Control and Parameters Setup------
 
-  // foc_current wont work bc rs2205 motor doesn't have current sensors
+  windMotor = false;
+  zeroAngleAfterWinding = 0;
+
   // motor.torque_controller = TorqueControlType::voltage;
   motor1.torque_controller = TorqueControlType::estimated_current;
 
@@ -153,24 +164,22 @@ void setup() {
   motor1.updateCurrentLimit(4.5);  // max current limit
   motor1.phase_resistance = 0.1f;
 
-  // manually adjust PID values, but do we also need LPF?
-  motor1.PID_velocity.P = 0.5;
-  motor1.PID_velocity.I = 4.0;
-  motor1.LPF_velocity.Tf = 0.01;
-
-  // Set a maximum speed limit
-  // this is speed at which motor responds
   // motor.velocity_limit = 10;
   motor1.velocity_limit = 2;
 
-  // Initialize the motor
+  motor1.PID_velocity.P = 0.2;  // higher than 0.2 = vibrations
+  motor1.PID_velocity.I = 0.5;
+  motor1.LPF_velocity.Tf = 0.15;
+
+  // Initialize the motor and FOC
   // motor.init();
   motor1.init();
-  // Initialize FOC
+  delay(1000);
   // motor.initFOC();
   motor1.initFOC();
+  delay(1000);
 
-  // creating command (command id, function pointer, command label)
+  // creating commands (command id, function pointer, command label)
   command.add('T', doTarget, "target angle");
   command.add('M', doMotor, "motor");
   command.add('S', doSpring, "spring");
@@ -185,9 +194,6 @@ void setup() {
 }
 
 void loop() {
-  static bool windMotor = false;
-
-  static float zeroAngleAfterWinding;
   // polling continuously I2C encoders
   // motor.loopFOC();
   motor1.loopFOC();
@@ -196,17 +202,15 @@ void loop() {
   // current_angle = sensor.getAngle();
   current_angle1 = sensor1.getAngle();
 
-  // curr_Velocity = sensor.getVelocity();
-  curr_Velocity1 = sensor1.getVelocity();
-
-  // still need to wound, then wound
+  // still need to wind, then wound
   if (!windMotor) {
-    static float windUpRevolution = -48;
-
-    motor1.move(windUpRevolution);
-    if (fabs(current_angle1 - windUpRevolution) < 0.1) {
+    motor1.move(windUpRad);
+    if (fabs(current_angle1 - windUpRad) < 0.1) {
       windMotor = true;
       zeroAngleAfterWinding = current_angle1;
+
+      // switch to torque mode now for "spring" behaviour
+      motor1.PID_velocity.reset();
       motor1.controller = MotionControlType::torque;
     }
   } else {
@@ -217,7 +221,7 @@ void loop() {
 
     // torque_input = spring_constant * angle_error - curr_Velocity * damping;
     torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
-    // instead of motor.move for motion control, need to generate PWM signals
+
     // motor.move(torque_input);
     motor1.move(torque_input1);
   }
@@ -236,11 +240,17 @@ void loop() {
 
 void board_init() {
   pinMode(32, INPUT_PULLUP);
+  digitalWrite(32, LOW);
   pinMode(33, INPUT_PULLUP);
+  digitalWrite(33, LOW);
   pinMode(25, INPUT_PULLUP);
+  digitalWrite(25, LOW);
   pinMode(26, INPUT_PULLUP);
+  digitalWrite(26, LOW);
   pinMode(27, INPUT_PULLUP);
+  digitalWrite(27, LOW);
   pinMode(14, INPUT_PULLUP);
+  digitalWrite(14, LOW);
 
   analogReadResolution(12);  // 12bit
 
