@@ -21,9 +21,8 @@ upload_port = COM17
 /* This current version has the wind spool on startup working properly even with
 the weight of the handle/string. The spring does not work as it once did. It is
 significantly weaker and acts more like a yoyo than a spring. Current and
-voltage limits were increased for enough torque to wind up the spool, but
-estimated current mode isn't yielding the same magnitude of corrective torque as
-voltage mode
+voltage limits were increased for enough torque to wind up the spool, but still
+need to tune PID variables in FOC current mode 
 
   */
 
@@ -44,10 +43,10 @@ float get_vin_Volt();
 void board_init();
 
 // Torque calculation variables
-float target_angle = 0;
-float spring_constant = 0.8;
+float spring_constant = 5;
+float spring_gain = 0.5;  // for extra stiffness the more you pull
 float damping = 0.3;
-float damping1 = 0.3;
+float damping1 = 0.1;
 float angle_error = 0;
 float angle_error1 = 0;
 float current_angle = 0;
@@ -58,7 +57,7 @@ float curr_Velocity = 0;
 float curr_Velocity1 = 0;
 
 // Wind spool on startup variables
-float zeroAngleAfterWinding = 0;
+float spring_start_angle = 0;
 float windUpRad = -48;
 bool windMotor = false;
 
@@ -76,6 +75,13 @@ MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
 TwoWire I2Cone = TwoWire(0);
 TwoWire I2Ctwo = TwoWire(1);
 
+// InlineCurrentSensor constructor
+//  - shunt_resistor  - shunt resistor value
+//  - gain  - current-sense op-amp gain
+//  - phA   - A phase adc pin
+//  - phB   - B phase adc pin
+InlineCurrentSense current_sense = InlineCurrentSense(0.01f, 50.0f, 35, 34);
+
 BLDCMotor motor = BLDCMotor(7);
 BLDCDriver3PWM driver = BLDCDriver3PWM(32, 33, 25, 12);
 
@@ -83,7 +89,6 @@ BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 
 Commander command = Commander(Serial);
-void doTarget(char* cmd) { command.scalar(&target_angle, cmd); }
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
 void doSpring(char* cmd) { command.scalar(&spring_constant, cmd); }
 
@@ -137,9 +142,20 @@ void setup() {
   // apparently?
   driver1.init();
 
+  current_sense.linkDriver(&driver1);
+
+  if (current_sense.init()) {
+    Serial.println("Current sense init success!");
+  } else {
+    Serial.println("Current sense init failed!");
+    return;
+  }
+
   // Connect the motor and driver objects
   // motor.linkDriver(&driver);
   motor1.linkDriver(&driver1);
+
+  motor1.linkCurrentSense(&current_sense);
 
   // FOC model selection
   // motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
@@ -155,14 +171,22 @@ void setup() {
   zeroAngleAfterWinding = 0;
 
   // motor.torque_controller = TorqueControlType::voltage;
-  motor1.torque_controller = TorqueControlType::estimated_current;
+  motor1.torque_controller = TorqueControlType::foc_current;
+
+  // foc current control parameters
+  motor1.PID_current_q.P = 0.5;
+  motor1.PID_current_q.I = 0.005;
+  motor1.PID_current_d.P = 0.5;
+  motor1.PID_current_d.I = 0.005;
+  motor1.LPF_current_q.Tf = 0.01;
+  motor1.LPF_current_d.Tf = 0.01;
 
   // [V] Please modify and check this value carefully, excessive voltage
   // and current may cause the driver board to burn out!!!
   // motor.voltage_limit = 0.3;  // Maximum voltage [V]
   motor1.voltage_limit = 0.5;      // Maximum voltage [V]
   motor1.updateCurrentLimit(1.0);  // max current limit
-  motor1.phase_resistance = 0.1f;
+  motor1.phase_resistance = 0.05f;
 
   // motor.velocity_limit = 10;
   motor1.velocity_limit = 3;
@@ -171,21 +195,23 @@ void setup() {
   motor1.PID_velocity.I = 0.5;
   motor1.LPF_velocity.Tf = 0.15;
 
-  // Initialize the motor and FOC
-  // motor.init();
   motor1.init();
-  delay(1000);
+  // Initialize FOC
   // motor.initFOC();
   motor1.initFOC();
+
   delay(1000);
 
-  motor1.voltage_limit = 2.5;  // Maximum voltage [V]
+  motor1.voltage_limit = 4.5;  // Maximum voltage [V]
   motor1.updateCurrentLimit(2.5);
 
   // creating commands (command id, function pointer, command label)
-  command.add('T', doTarget, "target angle");
-  command.add('M', doMotor, "motor");
+  char motor_id = 'M';
+  command.add(motor_id, doMotor, "motor");
   command.add('S', doSpring, "spring");
+
+  motor1.monitor_start_char = motor_id;
+  motor1.monitor_end_char = motor_id;
 
   Serial.println(F("Motor ready."));
   Serial.println(
@@ -196,14 +222,48 @@ void setup() {
   motor1.controller = MotionControlType::angle;
 }
 
-void loop() {
-  // polling continuously I2C encoders
-  // motor.loopFOC();
-  motor1.loopFOC();
+float computeTorqueIntoFOCCurrent(float angle, float velocity, float damping) {
+  float torque = -spring_constant * angle;
+  // float focCurrent = torque / 0.00415;
+  return torque;
+}
 
-  // torque = spring constant * (target angle - current angle)
-  // current_angle = sensor.getAngle();
+int count;
+bool correctAngleOnFirstLoop = false;
+void loop() {
+  motor1.loopFOC();
+  motor1.monitor();
+
   current_angle1 = sensor1.getAngle();
+  angle_error1 = current_angle1 - spring_start_angle;
+  curr_Velocity1 = sensor1.getVelocity();
+
+  // wrap angle because start angle and current are WAY OFF
+  if (!correctAngleOnFirstLoop) {
+    while (angle_error1 > PI) {
+      angle_error1 -= 2 * PI;
+    }
+
+    while (angle_error1 < -PI) {
+      angle_error1 += 2 * PI;
+    }
+  }
+  correctAngleOnFirstLoop = true;
+
+  /*
+  count++;
+  if (count >= 500) {
+    Serial.printf("Torque: ");
+    Serial.println(torque_input1);
+    Serial.print("Spring Start Angle: ");
+    Serial.println(spring_start_angle);
+    Serial.print("Angle: ");
+    Serial.println(current_angle1);
+    Serial.print("Current velocity: ");
+    Serial.println(curr_Velocity1);
+
+    count = 0;
+  }*/
 
   // still need to wind, then wound
   if (!windMotor) {
@@ -212,7 +272,7 @@ void loop() {
       motor1.move(0);
       delay(200);
 
-      zeroAngleAfterWinding = current_angle1;
+      spring_start_angle = current_angle1;
 
       // switch to torque mode now for "spring" behaviour
       motor1.PID_velocity.reset();
@@ -220,23 +280,12 @@ void loop() {
 
       windMotor = true;
     }
-  } else {
-    current_angle1 = sensor1.getAngle();
-    // angle_error = (target_angle - current_angle);
-    angle_error1 = (zeroAngleAfterWinding - current_angle1);
-    curr_Velocity1 = sensor1.getVelocity();
+  } else {  //----ENTERING TORQUE MODE----
+    torque_input1 =
+        computeTorqueIntoFOCCurrent(angle_error1, curr_Velocity1, damping1);
 
-    // torque_input = spring_constant * angle_error - curr_Velocity * damping;
-    torque_input1 = spring_constant * angle_error1 - curr_Velocity1 * damping1;
-
-    // motor.move(torque_input);
     motor1.move(torque_input1);
   }
-
-  //----------Centre Encoder Readings----------
-  long count = centreEncoder.getCount();
-  Serial.print("Encoder Count: ");
-  Serial.println(count);
 
   // When the voltage is lower than the set value, the motor will be disabled.
   board_check();
