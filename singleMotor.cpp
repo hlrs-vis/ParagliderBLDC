@@ -22,12 +22,14 @@ upload_port = COM17
 the weight of the handle/string. The spring does not work as it once did. It is
 significantly weaker and acts more like a yoyo than a spring. Current and
 voltage limits were increased for enough torque to wind up the spool, but still
-need to tune PID variables in FOC current mode 
+need to tune PID variables in FOC current mode
 
   */
 
 #include <ESP32Encoder.h>
 #include <SimpleFOC.h>
+#include <WebServer.h>
+#include <WiFi.h>
 #include <Wire.h>
 
 // actual wiring currently has PINB on IO4 and PINA on IO15
@@ -37,10 +39,21 @@ need to tune PID variables in FOC current mode
 
 // Setting the alarm voltage
 #define UNDERVOLTAGE_THRES 11.1
+#define VIN_PIN 13
 
-void board_check();
-float get_vin_Volt();
-void board_init();
+// ESP32 server
+const char* ssid = "RUSVIS";
+const char* password = "hlrsp1nkg0ld";
+
+// Adjustable Web Server Values
+float qAxesP = 0;
+float qAxesI = 0;
+float qAxesD = 0;
+float dAxesP = 0;
+float dAxesI = 0;
+float dAxesD = 0;
+float voltMax = 0;
+float ampMax = 0;
 
 // Torque calculation variables
 float spring_constant = 5;
@@ -60,8 +73,10 @@ float curr_Velocity1 = 0;
 float spring_start_angle = 0;
 float windUpRad = -48;
 bool windMotor = false;
+bool correctAngleOnFirstLoop = false;
 
 // Board safety check variables
+int count;
 bool flag_under_voltage = false;
 uint32_t prev_millis_board;
 
@@ -75,11 +90,8 @@ MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
 TwoWire I2Cone = TwoWire(0);
 TwoWire I2Ctwo = TwoWire(1);
 
-// InlineCurrentSensor constructor
-//  - shunt_resistor  - shunt resistor value
-//  - gain  - current-sense op-amp gain
-//  - phA   - A phase adc pin
-//  - phB   - B phase adc pin
+// InlineCurrentSensor constructor (shunt_resistor, gain, phA adc pin, phB adc
+// pin)
 InlineCurrentSense current_sense = InlineCurrentSense(0.01f, 50.0f, 35, 34);
 
 BLDCMotor motor = BLDCMotor(7);
@@ -89,20 +101,94 @@ BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 
 Commander command = Commander(Serial);
+WebServer server(80);
+
 void doMotor(char* cmd) { command.motor(&motor, cmd); }
-void doSpring(char* cmd) { command.scalar(&spring_constant, cmd); }
+float computeTorque(float angle, float velocity, float damping);
+void board_check();
+float get_vin_Volt();
+void board_init();
+void handleRoot();
+
+void handleRoot() {
+  String html = R"rawliteral(
+
+  <!DOCTYPE html>
+  <html>
+  <head>
+
+  <meta name = "viewport" content="width=device-width, initial-scale=1">
+  
+  <body><h1>SimpleFOC tuning</h1>
+    <form action="/get" method="POST">
+      <p> Q Axis P: </p>
+      <input type="number" step = "0.01" name="inputP">
+      <input type="submit" value="Submit">
+    </form><br>
+
+    <form action="/get" method="POST">
+      <p> Q Axis I: </p>
+      <input type="number" step = "0.01" name="inputI">
+      <input type="submit" value="Submit">
+    </form><br>
+      
+    <form action="/get" method="POST">
+      <p> Q Axis D: </p>
+      <input type="number" step = "0.01" name="inputD">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
+  </body>
+  </html>
+
+
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleGet() {
+  String inputMessage;
+  String inputParam;
+
+  // check if client contains a specific argument called inputP and update
+  // motorPID accordingly
+  if (server.hasArg("inputP")) {
+    inputMessage = server.arg("inputP");
+    inputParam = "inputP";
+
+    motor1.PID_current_q.P = inputMessage.toFloat();
+  } else if (server.hasArg("inputI")) {
+    inputMessage = server.arg("inputI");
+    inputParam = "inputI";
+
+    motor1.PID_current_q.I = inputMessage.toFloat();
+  } else if (server.hasArg("inputD")) {
+    inputMessage = server.arg("inputD");
+    inputParam = "inputD";
+
+    motor1.PID_current_q.D = inputMessage.toFloat();
+  }
+
+  Serial.println(inputMessage);
+
+  String response = "HTTP GET request sent to your ESP on input field (" +
+                    inputParam + ") with value: " + inputMessage +
+                    "<br><a href=\"/\">Return to Home Page</a>";
+
+  // print the status of what input field was just altered on new page
+  server.send(200, "text/html", response);
+}
 
 void setup() {
   Serial.begin(115200);
 
   Serial.println("===== BOOT =====");
 
+  // ---- BOARD + HARDWARE PERIPHERAL SETUP -----
   board_init();
 
-  pinMode(PINA, INPUT_PULLUP);
-  pinMode(PINB, INPUT_PULLUP);
-
-  // ESP32Encoder::useInternalWeakPullResistors = puType::up;
   centreEncoder.attachFullQuad(PINA, PINB);
 
   centreEncoder.setCount(0);
@@ -112,20 +198,6 @@ void setup() {
   // I2Cone.begin(19, 18, 400000UL);  // AS5600_M0
   I2Ctwo.begin(23, 5, 100000UL);  // AS5600_M1
 
-  Serial.println("Scanning...");
-
-  for (int addr = 1; addr < 127; addr++) {
-    I2Ctwo.beginTransmission(addr);
-
-    if (I2Ctwo.endTransmission() == 0) {
-      Serial.print("Found device at 0x");
-      Serial.println(addr, HEX);
-    }
-
-    delay(5);
-  }
-
-  Serial.println("Done");
   // sensor.init(&I2Cone);
   sensor1.init(&I2Ctwo);
 
@@ -134,12 +206,8 @@ void setup() {
   motor1.linkSensor(&sensor1);
 
   // Supply voltage setting [V]
-  // driver.voltage_power_supply = get_vin_Volt();
-  // driver.init();
-
   driver1.voltage_power_supply = get_vin_Volt();
-  // driver1.pwm_frequency = 1000;  higher frequency eliminates noise
-  // apparently?
+  // driver.init();
   driver1.init();
 
   current_sense.linkDriver(&driver1);
@@ -168,7 +236,6 @@ void setup() {
   //-------Torque Control and Parameters Setup------
 
   windMotor = false;
-  zeroAngleAfterWinding = 0;
 
   // motor.torque_controller = TorqueControlType::voltage;
   motor1.torque_controller = TorqueControlType::foc_current;
@@ -206,33 +273,37 @@ void setup() {
   motor1.updateCurrentLimit(2.5);
 
   // creating commands (command id, function pointer, command label)
-  char motor_id = 'M';
-  command.add(motor_id, doMotor, "motor");
-  command.add('S', doSpring, "spring");
-
-  motor1.monitor_start_char = motor_id;
-  motor1.monitor_end_char = motor_id;
-
-  Serial.println(F("Motor ready."));
-  Serial.println(
-      F("Set the target velocity, voltage, and virtual spring constant using "
-        "serial terminal:"));
+  command.add('M', doMotor, "motor");
 
   //-------Winding String Upon Startup--------
   motor1.controller = MotionControlType::angle;
+
+  // ------------ TUNING WEBPAGE -------------
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+
+  server.on("/get", handleGet);
+
+  server.begin();
+  Serial.println("HTTP server started");
 }
 
-float computeTorqueIntoFOCCurrent(float angle, float velocity, float damping) {
-  float torque = -spring_constant * angle;
-  // float focCurrent = torque / 0.00415;
-  return torque;
-}
-
-int count;
-bool correctAngleOnFirstLoop = false;
 void loop() {
+  server.handleClient();
+
   motor1.loopFOC();
-  motor1.monitor();
 
   current_angle1 = sensor1.getAngle();
   angle_error1 = current_angle1 - spring_start_angle;
@@ -281,32 +352,35 @@ void loop() {
       windMotor = true;
     }
   } else {  //----ENTERING TORQUE MODE----
-    torque_input1 =
-        computeTorqueIntoFOCCurrent(angle_error1, curr_Velocity1, damping1);
+    torque_input1 = computeTorque(angle_error1, curr_Velocity1, damping1);
 
     motor1.move(torque_input1);
   }
 
   // When the voltage is lower than the set value, the motor will be disabled.
-  board_check();
+  // board_check();
 
   // User Communications
   if (!flag_under_voltage) command.run();
 }
 
+float computeTorque(float angle, float velocity, float damping) {
+  float torque = -spring_constant * angle + 0.76;
+  // float focCurrent = torque / 0.00415;
+  return torque;
+}
+
 void board_init() {
   pinMode(32, INPUT_PULLUP);
-  digitalWrite(32, LOW);
   pinMode(33, INPUT_PULLUP);
-  digitalWrite(33, LOW);
   pinMode(25, INPUT_PULLUP);
-  digitalWrite(25, LOW);
   pinMode(26, INPUT_PULLUP);
-  digitalWrite(26, LOW);
   pinMode(27, INPUT_PULLUP);
-  digitalWrite(27, LOW);
   pinMode(14, INPUT_PULLUP);
-  digitalWrite(14, LOW);
+  pinMode(VIN_PIN, INPUT);
+
+  pinMode(PINA, INPUT_PULLUP);
+  pinMode(PINB, INPUT_PULLUP);
 
   analogReadResolution(12);  // 12bit
 
@@ -320,7 +394,14 @@ void board_init() {
 }
 
 // helper function for board_check
-float get_vin_Volt() { return analogReadMilliVolts(13) * 8.5 / 1000; }
+float get_vin_Volt() {
+  float vin = analogRead(VIN_PIN);
+
+  vin = vin * 3.3 / 4095.0;
+  vin *= 8.5;  // voltage divider value on MKS board
+  return vin;
+  // return analogReadMilliVolts(VIN_PIN) * 8.5 / 1000;
+}
 
 // making sure VIN voltage on board isn't overshooting
 void board_check() {
@@ -335,7 +416,7 @@ void board_check() {
       enableState = 0;
       uint8_t count = 5;
       while (count--) {
-        vin_Volt = get_vin_Volt();
+        float vin_Volt = get_vin_Volt();
         if (vin_Volt > UNDERVOLTAGE_THRES) {
           flag_under_voltage = false;
           break;
