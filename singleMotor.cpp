@@ -56,7 +56,7 @@ float voltMax = 0;
 float ampMax = 0;
 
 // Torque calculation variables
-float spring_constant = 5;
+float spring_constant = 0.8;
 float spring_gain = 0.5;  // for extra stiffness the more you pull
 float damping = 0.3;
 float damping1 = 0.1;
@@ -68,6 +68,7 @@ float torque_input = 0;
 float torque_input1 = 0;
 float curr_Velocity = 0;
 float curr_Velocity1 = 0;
+float handleWeight = 0.76;
 
 // Wind spool on startup variables
 float spring_start_angle = 0;
@@ -139,6 +140,41 @@ void handleRoot() {
       
     </form><br>
 
+    <form action="/get" method="POST">
+      <p> Spring Constant: </p>
+      <input type="number" step = "0.01" name="inputSpring">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
+    <form action="/get" method="POST">
+      <p> Damping Constant: </p>
+      <input type="number" step = "0.01" name="inputDamping">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
+    <form action="/get" method="POST">
+      <p> Voltage: </p>
+      <input type="number" step = "0.01" name="inputVolt">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
+    <form action="/get" method="POST">
+      <p> Current: </p>
+      <input type="number" step = "0.01" name="inputAmp">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
+    <form action="/get" method="POST">
+      <p> Handle Weight: </p>
+      <input type="number" step = "0.01" name="inputWeight">
+      <input type="submit" value="Submit">
+      
+    </form><br>
+
   </body>
   </html>
 
@@ -169,6 +205,31 @@ void handleGet() {
     inputParam = "inputD";
 
     motor1.PID_current_q.D = inputMessage.toFloat();
+  } else if (server.hasArg("inputSpring")) {
+    inputMessage = server.arg("inputSpring");
+    inputParam = "inputSpring";
+
+    spring_constant = inputMessage.toFloat();
+  } else if (server.hasArg("inputDamping")) {
+    inputMessage = server.arg("inputDamping");
+    inputParam = "inputDamping";
+
+    damping1 = inputMessage.toFloat();
+  } else if (server.hasArg("inputVolt")) {
+    inputMessage = server.arg("inputVolt");
+    inputParam = "inputVolt";
+
+    motor1.voltage_limit = inputMessage.toFloat();
+  } else if (server.hasArg("inputAmp")) {
+    inputMessage = server.arg("inputAmp");
+    inputParam = "inputAmp";
+
+    motor1.updateCurrentLimit(inputMessage.toFloat());
+  } else if (server.hasArg("inputWeight")) {
+    inputMessage = server.arg("inputWeight");
+    inputParam = "inputWeight";
+
+    handleWeight = inputMessage.toFloat();
   }
 
   Serial.println(inputMessage);
@@ -365,7 +426,7 @@ void loop() {
 }
 
 float computeTorque(float angle, float velocity, float damping) {
-  float torque = -spring_constant * angle + 0.76;
+  float torque = -spring_constant * angle + handleWeight;
   // float focCurrent = torque / 0.00415;
   return torque;
 }
