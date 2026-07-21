@@ -125,55 +125,47 @@ void handleRoot() {
   
   <body><h1>SimpleFOC tuning</h1>
     <form action="/get" method="POST">
-      <p> Q Axis P: </p>
-      <input type="number" value = "0.5" step = "0.01" name="inputP">
+      <p> Velocity P: </p>
+      <input type="number" value = "0.05" step = "0.01" name="inputP">
       <input type="submit" value="Submit">
     </form><br>
 
     <form action="/get" method="POST">
-      <p> Q Axis I: </p>
-      <input type="number" value = "0.005" step = "0.01" name="inputI">
+      <p> Velocity I: </p>
+      <input type="number" value = "1.0" step = "0.01" name="inputI">
       <input type="submit" value="Submit">
     </form><br>
-      
+
     <form action="/get" method="POST">
-      <p> Q Axis D: </p>
+      <p> Velocity D: </p>
       <input type="number" value = "0.0" step = "0.01" name="inputD">
       <input type="submit" value="Submit">
-      
     </form><br>
 
     <form action="/get" method="POST">
       <p> Spring Constant: </p>
-      <input type="number" value = "0.5" step = "0.01" name="inputSpring">
+      <input type="number" value = "0.1" step = "0.01" name="inputSpring">
       <input type="submit" value="Submit">
       
     </form><br>
 
     <form action="/get" method="POST">
       <p> Damping Constant: </p>
-      <input type="number" value = "0.1" step = "0.01" name="inputDamping">
+      <input type="number" value = "0.0" step = "0.01" name="inputDamping">
       <input type="submit" value="Submit">
       
     </form><br>
 
     <form action="/get" method="POST">
       <p> Voltage: </p>
-      <input type="number" value = "4.5" step = "0.01" name="inputVolt">
+      <input type="number" value = "0.5" step = "0.01" name="inputVolt">
       <input type="submit" value="Submit">
       
     </form><br>
 
     <form action="/get" method="POST">
-      <p> Current: </p>
-      <input type="number" value = "2.5" step = "0.01" name="inputAmp">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Handle Weight: </p>
-      <input type="number" value = "0.76" step = "0.01" name="inputWeight">
+      <p> Linear Stiffness: </p>
+      <input type="number" value = "0.00" step = "0.01" name="inputLinearStiff">
       <input type="submit" value="Submit">
       
     </form><br>
@@ -186,6 +178,8 @@ void handleRoot() {
 
   server.send(200, "text/html", html);
 }
+   
+
 
 void handleGet() {
   String inputMessage;
@@ -197,17 +191,17 @@ void handleGet() {
     inputMessage = server.arg("inputP");
     inputParam = "inputP";
 
-    motor1.PID_current_q.P = inputMessage.toFloat();
+    motor1.PID_velocity.P = inputMessage.toFloat();
   } else if (server.hasArg("inputI")) {
     inputMessage = server.arg("inputI");
     inputParam = "inputI";
 
-    motor1.PID_current_q.I = inputMessage.toFloat();
+    motor1.PID_velocity.I = inputMessage.toFloat();
   } else if (server.hasArg("inputD")) {
     inputMessage = server.arg("inputD");
     inputParam = "inputD";
 
-    motor1.PID_current_q.D = inputMessage.toFloat();
+    motor1.PID_velocity.D = inputMessage.toFloat();
   } else if (server.hasArg("inputSpring")) {
     inputMessage = server.arg("inputSpring");
     inputParam = "inputSpring";
@@ -223,16 +217,11 @@ void handleGet() {
     inputParam = "inputVolt";
 
     motor1.voltage_limit = inputMessage.toFloat();
-  } else if (server.hasArg("inputAmp")) {
-    inputMessage = server.arg("inputAmp");
-    inputParam = "inputAmp";
+  } else if (server.hasArg("inputLinearStiff")) {
+    inputMessage = server.arg("inputLinearStiff");
+    inputParam = "inputLinearStiff";
 
-    motor1.updateCurrentLimit(inputMessage.toFloat());
-  } else if (server.hasArg("inputWeight")) {
-    inputMessage = server.arg("inputWeight");
-    inputParam = "inputWeight";
-
-    handleWeight = inputMessage.toFloat();
+    non_linear_stiffness = inputMessage.toFloat();
   }
 
   Serial.println(inputMessage);
@@ -244,6 +233,7 @@ void handleGet() {
   // print the status of what input field was just altered on new page
   server.send(200, "text/html", response);
 }
+
 
 void setup() {
   Serial.begin(115200);
