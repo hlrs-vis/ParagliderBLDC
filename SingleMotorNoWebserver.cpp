@@ -1,519 +1,264 @@
-/* The platform.ini file that works with this code is as follows. If you get
-errors relating to needing updated versions, delete the .pio folder and do a
-full clean.
-
-[env:esp32dev]
-platform =
-https://github.com/pioarduino/platform-espressif32/releases/download/51.03.04/platform-espressif32.zip
-board = esp32dev
-framework = arduino
-
-lib_deps =
-    askuric/Simple FOC @ 2.4.0
-    madhephaestus/ESP32Encoder @ ^0.11.7
-
-monitor_speed = 115200
-upload_port = COM17
-
-
+/*
+  PlatformIO Configuration:
+  [env:esp32dev]
+  platform = https://github.com/pioarduino/platform-espressif32/releases/download/51.03.04/platform-espressif32.zip
+  board = esp32dev
+  framework = arduino
+  lib_deps =
+      askuric/Simple FOC @ 2.4.0
+      madhephaestus/ESP32Encoder @ ^0.11.7
+  monitor_speed = 115200
+  upload_port = COM17
 */
-
-/* This current version has the wind spool on startup working properly even with
-the weight of the handle/string. The spring does not work as it once did. It is
-significantly weaker and acts more like a yoyo than a spring. Current and
-voltage limits were increased for enough torque to wind up the spool, but still
-need to tune PID variables in FOC current mode
-
-  */
 
 #include <ESP32Encoder.h>
 #include <SimpleFOC.h>
-#include <WebServer.h>
-#include <WiFi.h>
 #include <Wire.h>
 
-// actual wiring currently has PINB on IO4 and PINA on IO15
 #define PINA 15
 #define PINB 4
 #define PINI 2
 
-// Setting the alarm voltage
 #define UNDERVOLTAGE_THRES 11.1
-#define VIN_PIN 13
 
-// ESP32 server
-const char* ssid = "RUSVIS";
-const char* password = "hlrsp1nkg0ld";
+void board_check();
+float get_vin_Volt();
+void board_init();
 
-// Adjustable Web Server Values
-float qAxesP = 0;
-float qAxesI = 0;
-float qAxesD = 0;
-float dAxesP = 0;
-float dAxesI = 0;
-float dAxesD = 0;
-float voltMax = 0;
-float ampMax = 0;
+// ============================================================================
+// HARDWARE CURRENT LIMITS & SAFETY
+// ============================================================================
+const float FFB_CURRENT_LIMIT     = 3.80f; // [Amps] Safe continuous current ceiling (5A Driver limit)
 
-// Torque calculation variables
-float spring_constant = 0.1;
-float non_linear_stiffness = 0.0;  // for extra stiffness the more you pull
-float damping = 0.3;
-float damping1 = 0.0;
-float angle_error = 0;
-float angle_error1 = 0;
-float current_angle = 0;
+// ============================================================================
+// PHASE 1: REEL-IN AT SPECIFIC CURRENT & STALL DETECTION (PURE TORQUE MODE)
+// ============================================================================
+float REEL_IN_CURRENT           = 1.75f; // [Amps] Specific torque current used to pull handle home
+const float STALL_VEL_THRESHOLD = 2.5f;  // [rad/s] Velocity threshold confirming mechanical stop
+const uint32_t STALL_TIME_MS    = 250;   // [ms] Duration velocity must remain low to confirm home
+
+// ============================================================================
+// PHASE 2: DYNAMIC TORQUE RESISTANCE TUNING (PURE TORQUE MODE)
+// ============================================================================
+float I_rest                      = 0.50f; // [Amps] Baseline tension at home stop
+float k_spring                    = 0.12f; // [Amps/rad] Linear current ramp per radian pulled
+float k_quad                      = 0.008f;// [Amps/rad^2] Subtle quadratic ramp for deep pulls
+float d_velocity                  = 0.08f; // [Amps/(rad/s)] Dynamic current added to resist movement
+
+// Working variables
 float current_angle1 = 0;
-float torque_input = 0;
-float torque_input1 = 0;
-float curr_Velocity = 0;
-float curr_Velocity1 = 0;
-float handleWeight = 0.15;
-
-LowPassFilter velFilter = LowPassFilter(0.05f);
-
-// Wind spool on startup variables
 float spring_start_angle = 0;
-float windUpRad = -48;
 bool windMotor = false;
-bool correctAngleOnFirstLoop = false;
+uint32_t stall_timer = 0;
+uint32_t reel_print_timer = 0; // Timer for non-blocking serial outputs during reel-in
+uint32_t ffb_print_timer = 0;  // Timer for non-blocking serial outputs during FFB phase
 
-// Board safety check variables
-int count;
 bool flag_under_voltage = false;
 uint32_t prev_millis_board;
-uint32_t prev_millis_limits = 0;
 
-// Objects (encoder, sensors, motors, drivers)
+// Hardware Objects
 ESP32Encoder centreEncoder;
-
-MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
 MagneticSensorI2C sensor1 = MagneticSensorI2C(AS5600_I2C);
-
-// magnetic rotary encoder that senses internal motor position
-TwoWire I2Cone = TwoWire(0);
 TwoWire I2Ctwo = TwoWire(1);
 
-// InlineCurrentSensor constructor (shunt_resistor, gain, phA adc pin, phB adc
-// pin)
-// InlineCurrentSense current_sense = InlineCurrentSense(0.01f, 50.0f, 35, 34);
-
-BLDCMotor motor = BLDCMotor(7);
-BLDCDriver3PWM driver = BLDCDriver3PWM(32, 33, 25, 12);
-
+InlineCurrentSense current_sense = InlineCurrentSense(0.01f, 50.0f, 35, 34);
 BLDCMotor motor1 = BLDCMotor(7);
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(26, 27, 14, 12);
 
 Commander command = Commander(Serial);
-WebServer server(80);
-
-void doMotor(char* cmd) { command.motor(&motor, cmd); }
-float computeTorqueCommand(float angle, float velocity, float damping);
-void board_check();
-float get_vin_Volt();
-void board_init();
-void handleRoot();
-
-void handleRoot() {
-  String html = R"rawliteral(
-
-  <!DOCTYPE html>
-  <html>
-  <head>
-
-  <meta name = "viewport" content="width=device-width, initial-scale=1">
-  
-  <body><h1>SimpleFOC tuning</h1>
-    <form action="/get" method="POST">
-      <p> Q Axis P: </p>
-      <input type="number" value = "0.5" step = "0.01" name="inputP">
-      <input type="submit" value="Submit">
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Q Axis I: </p>
-      <input type="number" value = "0.005" step = "0.01" name="inputI">
-      <input type="submit" value="Submit">
-    </form><br>
-      
-    <form action="/get" method="POST">
-      <p> Q Axis D: </p>
-      <input type="number" value = "0.0" step = "0.01" name="inputD">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Spring Constant: </p>
-      <input type="number" value = "0.5" step = "0.01" name="inputSpring">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Damping Constant: </p>
-      <input type="number" value = "0.1" step = "0.01" name="inputDamping">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Voltage: </p>
-      <input type="number" value = "4.5" step = "0.01" name="inputVolt">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Current: </p>
-      <input type="number" value = "2.5" step = "0.01" name="inputAmp">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-    <form action="/get" method="POST">
-      <p> Handle Weight: </p>
-      <input type="number" value = "0.76" step = "0.01" name="inputWeight">
-      <input type="submit" value="Submit">
-      
-    </form><br>
-
-  </body>
-  </html>
-
-
-)rawliteral";
-
-  server.send(200, "text/html", html);
-}
-
-void handleGet() {
-  String inputMessage;
-  String inputParam;
-
-  // check if client contains a specific argument called inputP and update
-  // motorPID accordingly
-  if (server.hasArg("inputP")) {
-    inputMessage = server.arg("inputP");
-    inputParam = "inputP";
-
-    motor1.PID_current_q.P = inputMessage.toFloat();
-  } else if (server.hasArg("inputI")) {
-    inputMessage = server.arg("inputI");
-    inputParam = "inputI";
-
-    motor1.PID_current_q.I = inputMessage.toFloat();
-  } else if (server.hasArg("inputD")) {
-    inputMessage = server.arg("inputD");
-    inputParam = "inputD";
-
-    motor1.PID_current_q.D = inputMessage.toFloat();
-  } else if (server.hasArg("inputSpring")) {
-    inputMessage = server.arg("inputSpring");
-    inputParam = "inputSpring";
-
-    spring_constant = inputMessage.toFloat();
-  } else if (server.hasArg("inputDamping")) {
-    inputMessage = server.arg("inputDamping");
-    inputParam = "inputDamping";
-
-    damping1 = inputMessage.toFloat();
-  } else if (server.hasArg("inputVolt")) {
-    inputMessage = server.arg("inputVolt");
-    inputParam = "inputVolt";
-
-    motor1.voltage_limit = inputMessage.toFloat();
-  } else if (server.hasArg("inputAmp")) {
-    inputMessage = server.arg("inputAmp");
-    inputParam = "inputAmp";
-
-    motor1.updateCurrentLimit(inputMessage.toFloat());
-  } else if (server.hasArg("inputWeight")) {
-    inputMessage = server.arg("inputWeight");
-    inputParam = "inputWeight";
-
-    handleWeight = inputMessage.toFloat();
-  }
-
-  Serial.println(inputMessage);
-
-  String response = "HTTP GET request sent to your ESP on input field (" +
-                    inputParam + ") with value: " + inputMessage +
-                    "<br><a href=\"/\">Return to Home Page</a>";
-
-  // print the status of what input field was just altered on new page
-  server.send(200, "text/html", response);
-}
+void doMotor(char* cmd) { command.motor(&motor1, cmd); }
+void doReelCurrent(char* cmd) { command.scalar(&REEL_IN_CURRENT, cmd); }
+void doSpring(char* cmd) { command.scalar(&k_spring, cmd); }
+void doQuad(char* cmd) { command.scalar(&k_quad, cmd); }
+void doDamp(char* cmd) { command.scalar(&d_velocity, cmd); }
+void doRest(char* cmd) { command.scalar(&I_rest, cmd); }
 
 void setup() {
   Serial.begin(115200);
-
-  Serial.println("===== BOOT =====");
-
-  // ---- BOARD + HARDWARE PERIPHERAL SETUP -----
-  board_init();
-
-  centreEncoder.attachFullQuad(PINA, PINB);
-
-  centreEncoder.setCount(0);
-
   delay(500);
+  Serial.println("===== BOOTING PARAGLIDER FFB (PURE CURRENT MODE) =====");
 
-  // I2Cone.begin(19, 18, 400000UL);  // AS5600_M0
-  I2Ctwo.begin(23, 5, 100000UL);  // AS5600_M1
-
-  // sensor.init(&I2Cone);
-  sensor1.init(&I2Ctwo);
-
-  // Connect the motor object and the sensor object
-  // motor.linkSensor(&sensor);
-  motor1.linkSensor(&sensor1);
-
-  // Supply voltage setting [V]
-  driver1.voltage_power_supply = get_vin_Volt();
-  // driver.init();
-  driver1.init();
-
-  /*current_sense.linkDriver(&driver1);
-
-  if (current_sense.init()) {
-    Serial.println("Current sense init success!");
-  } else {
-    Serial.println("Current sense init failed!");
-    return;
-  }*/
-
-  // Connect the motor and driver objects
-  // motor.linkDriver(&driver);
-  motor1.linkDriver(&driver1);
-
-  // motor1.linkCurrentSense(&current_sense);
-
-  // FOC model selection
-  // motor.foc_modulation = FOCModulationType::SpaceVectorPWM;
-  motor1.foc_modulation = FOCModulationType::SinePWM;
-
-  // real time output of motor variables to serial terminal
-  // motor.useMonitoring(Serial);
-  motor1.useMonitoring(Serial);
-
-  //-------Torque Control and Parameters Setup------
-
-  windMotor = false;
-
-  // motor.torque_controller = TorqueControlType::voltage;
-  motor1.torque_controller = TorqueControlType::voltage;
-
-  // [V] Please modify and check this value carefully, excessive voltage
-  // and current may cause the driver board to burn out!!!
-  // motor.voltage_limit = 0.3;  // Maximum voltage [V]
-  motor1.voltage_limit = 1.0;  // Maximum voltage [V]
-
-  motor1.PID_velocity.P = 0.05;
-  motor1.PID_velocity.I = 1.0;
-  motor1.P_angle.P = 2.0;
-  motor1.velocity_limit = 5.0;
-
-  motor1.init();
-  // Initialize FOC
-  // motor.initFOC();
-  motor1.initFOC();
-
-  delay(1000);
-
-  // creating commands (command id, function pointer, command label)
-  command.add('M', doMotor, "motor");
-
-  //-------Winding String Upon Startup--------
-  motor1.controller = MotionControlType::angle_nocascade;
-
-  // ------------ TUNING WEBPAGE -------------
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("");
-  Serial.println("WiFi connected.");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-
-  server.on("/", handleRoot);
-
-  server.on("/get", handleGet);
-
-  server.begin();
-  Serial.println("HTTP server started");
-}
-
-void loop() {
-  server.handleClient();
-
-  motor1.loopFOC();
-
-  current_angle1 = sensor1.getAngle();
-  angle_error1 = current_angle1 - spring_start_angle;
-
-  // Filtered velocity for damping math
-  curr_Velocity1 = velFilter(sensor1.getVelocity());
-
-  // wrap angle because start angle and current are WAY OFF
-  if (!correctAngleOnFirstLoop) {
-    while (angle_error1 > PI) {
-      angle_error1 -= 2 * PI;
-    }
-
-    while (angle_error1 < -PI) {
-      angle_error1 += 2 * PI;
-    }
-  }
-  correctAngleOnFirstLoop = true;
-
-  /*
-  count++;
-  if (count >= 500) {
-    Serial.printf("Torque: ");
-    Serial.println(torque_input1);
-    Serial.print("Spring Start Angle: ");
-    Serial.println(spring_start_angle);
-    Serial.print("Angle: ");
-    Serial.println(current_angle1);
-    Serial.print("Current velocity: ");
-    Serial.println(curr_Velocity1);
-
-    count = 0;
-  }*/
-
-  // still need to wind, then wound
-  if (!windMotor) {
-    motor1.move(windUpRad);
-    if (fabs(current_angle1 - windUpRad) < 0.1) {
-      motor1.move(0);
-      delay(200);
-
-      spring_start_angle = current_angle1;
-
-      // switch to torque mode now for "spring" behaviour
-      motor1.PID_velocity.reset();
-      motor1.controller = MotionControlType::torque;
-
-      windMotor = true;
-    }
-  } else {  //----ENTERING TORQUE MODE----
-    torque_input1 =
-        computeTorqueCommand(angle_error1, curr_Velocity1, damping1);
-
-    motor1.move(torque_input1);
-  }
-
-  // When the voltage is lower than the set value, the motor will be disabled.
-  // board_check();
-
-  // User Communications
-  if (!flag_under_voltage) command.run();
-}
-
-float computeTorqueCommand(float angle, float velocity, float damping) {
-  // Deadband to prevent buzzing at exact zero
-  if (fabs(angle) < 0.005f) {
-    return 0.0f;
-  }
-
-  float nonlinear_force = non_linear_stiffness * angle * fabs(angle);
-  float torque = (-spring_constant * angle) - nonlinear_force -
-                 (damping * velocity) + handleWeight;
-  return torque;
-}
-
-void check_motor_limits() {
-  uint32_t curr_millis = millis();
-
-  // Check every 100ms to avoid I2C/Serial congestion
-  if (curr_millis - prev_millis_limits >= 100) {
-    prev_millis_limits = curr_millis;
-
-    // Check Direct Voltage Cap
-    if (fabs(torque_input1) >= motor1.voltage_limit) {
-      Serial.print("[CAP LIMIT] Voltage target saturated! Commanded: ");
-      Serial.print(fabs(torque_input1));
-      Serial.print(" | Max Allowed: ");
-      Serial.println(motor1.voltage_limit);
-    }
-
-    // Check Velocity Cap (Triggers warning at 95% of limit)
-    if (fabs(curr_Velocity1) >= (motor1.velocity_limit * 0.95f)) {
-      Serial.print("[CAP LIMIT] Velocity maxed out! Actual: ");
-      Serial.print(fabs(curr_Velocity1));
-      Serial.print(" rad/s | Limit: ");
-      Serial.println(motor1.velocity_limit);
-    }
-  }
-}
-
-void board_init() {
-  pinMode(32, INPUT_PULLUP);
-  pinMode(33, INPUT_PULLUP);
-  pinMode(25, INPUT_PULLUP);
-  pinMode(26, INPUT_PULLUP);
-  pinMode(27, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-  pinMode(VIN_PIN, INPUT);
+  board_init();
 
   pinMode(PINA, INPUT_PULLUP);
   pinMode(PINB, INPUT_PULLUP);
+  centreEncoder.attachFullQuad(PINA, PINB);
+  centreEncoder.setCount(0);
 
-  analogReadResolution(12);  // 12bit
+  // Setup AS5600 Encoder
+  I2Ctwo.begin(23, 5, 400000UL); // Fast 400kHz I2C
+  sensor1.init(&I2Ctwo);
+  motor1.linkSensor(&sensor1);
+
+  // Driver Setup
+  driver1.voltage_power_supply = get_vin_Volt();
+  driver1.pwm_frequency = 25000; // 25kHz PWM suppresses low-inductance noise
+  driver1.init();
+
+  // Current Sense Setup
+  current_sense.linkDriver(&driver1);
+  if (!current_sense.init()) {
+    Serial.println("FATAL: Current sense init failed!");
+    return;
+  }
+
+  motor1.linkDriver(&driver1);
+  motor1.linkCurrentSense(&current_sense);
+  motor1.foc_modulation = FOCModulationType::SpaceVectorPWM;
+
+  // --------------------------------------------------------------------------
+  // PERMANENT CURRENT / TORQUE CONTROL CONFIGURATION
+  // --------------------------------------------------------------------------
+  motor1.torque_controller = TorqueControlType::foc_current;
+  motor1.controller = MotionControlType::torque; // Permanent Pure Current Mode
+
+  // Inner Current Loop PID Tuning
+  motor1.PID_current_q.P = 0.35f;
+  motor1.PID_current_q.I = 15.0f;
+  motor1.PID_current_d.P = 0.35f;
+  motor1.PID_current_d.I = 15.0f;
+  motor1.LPF_current_q.Tf = 0.008f;
+  motor1.LPF_current_d.Tf = 0.008f;
+
+  // Driver & Voltage Boundaries
+  motor1.voltage_limit = 9.00f;        // Voltage headroom for current loop
+  motor1.voltage_sensor_align = 0.35f; // Anti-brownout calibration limit
+  motor1.updateCurrentLimit(FFB_CURRENT_LIMIT); 
+  motor1.phase_resistance = 0.08f;
+
+  motor1.init();
+  motor1.initFOC();
+
+  // Serial commands for Live Tuning
+  command.add('M', doMotor, "motor");
+  command.add('W', doReelCurrent, "reel-in amperage (A)");
+  command.add('S', doSpring, "linear current ramp (A/rad)");
+  command.add('Q', doQuad, "quadratic ramp (A/rad^2)");
+  command.add('D', doDamp, "velocity resistance (A/(rad/s))");
+  command.add('I', doRest, "resting baseline current (A)");
+
+  Serial.printf("Motor aligned. Continuous Current Mode ACTIVE. Reeling in at %.2f A...\n", REEL_IN_CURRENT);
+}
+
+void loop() {
+  // High-frequency FOC calculation
+  motor1.loopFOC();
+
+  current_angle1 = sensor1.getAngle();
+
+  // --------------------------------------------------------------------------
+  // PHASE 1: TORQUE REEL-IN & STALL DETECTION AT SPECIFIC CURRENT
+  // --------------------------------------------------------------------------
+  if (!windMotor) {
+    // Command the fixed specific reel-in current
+    motor1.move(-REEL_IN_CURRENT);
+
+    // Read current rotation speed
+    float current_vel = fabs(sensor1.getVelocity());
+
+    // Print measured q-axis current and velocity threshold state every 200 ms during winding
+    if (millis() - reel_print_timer >= 200) {
+      reel_print_timer = millis();
+      float actual_iq = fabs(motor1.current.q);
+      
+      bool is_below_threshold = (current_vel < STALL_VEL_THRESHOLD);
+      Serial.printf("[WINDING] Current: %.2f A | Vel: %.2f rad/s | Threshold (%.2f rad/s) Reached? %s\n", 
+                    actual_iq, current_vel, STALL_VEL_THRESHOLD, is_below_threshold ? "YES (BELOW)" : "NO (ABOVE)");
+    }
+
+    // Check if the motor stopped spinning after hitting the end stop
+    if (current_vel < STALL_VEL_THRESHOLD) {
+      if (stall_timer == 0) {
+        stall_timer = millis();
+      } else if (millis() - stall_timer >= STALL_TIME_MS) {
+        // Handle stalled at the hard stop under specified reel current
+        spring_start_angle = current_angle1;
+        windMotor = true;
+
+        Serial.printf("\n>>> STALL DETECTED at hard stop! Final Measured Current: %.2f A <<<\n", fabs(motor1.current.q));
+        Serial.printf("Home position locked at %.2f rad. Dynamic FFB ACTIVE.\n\n", spring_start_angle);
+      }
+    } else {
+      stall_timer = 0; // Still rotating, reset stall timer
+    }
+
+  // --------------------------------------------------------------------------
+  // PHASE 2: DYNAMIC FORCE FEEDBACK CURRENT CONTROL
+  // --------------------------------------------------------------------------
+  } else { 
+    // Distance pulled away from home stop (positive when pulled out)
+    float displacement = current_angle1 - spring_start_angle;
+    
+    // Line pull velocity (positive when pulling out)
+    float velocity = sensor1.getVelocity();
+    float abs_velocity = fabs(velocity);
+
+    float target_current = I_rest; // Start at baseline holding current
+
+    if (displacement > 0.0f) {
+      // 1. Linear current ramp based on distance pulled
+      target_current += k_spring * displacement;
+
+      // 2. Gentle quadratic current curve
+      target_current += k_quad * (displacement * displacement);
+
+      // 3. Dynamic current increase to resist speed/movement
+      if (velocity > 0.0f) {
+        target_current += d_velocity * velocity;
+      }
+    }
+
+    // Print velocity threshold status during Phase 2 every 200 ms
+    if (millis() - ffb_print_timer >= 200) {
+      ffb_print_timer = millis();
+      bool threshold_exceeded = (abs_velocity >= STALL_VEL_THRESHOLD);
+      Serial.printf("[FFB MODE] Vel: %.2f rad/s | Threshold (%.2f rad/s) Reached? %s\n",
+                    abs_velocity, STALL_VEL_THRESHOLD, threshold_exceeded ? "YES (EXCEEDED)" : "NO (BELOW)");
+    }
+
+    // Safely clamp the current command within continuous threshold
+    target_current = constrain(target_current, 0.0f, FFB_CURRENT_LIMIT);
+
+    // Direct negative q-axis current command to pull back towards home
+    motor1.move(-target_current);
+  }
+
+  // Safety checks & Serial updates
+  board_check();
+  if (!flag_under_voltage) command.run();
+}
+
+void board_init() {
+  analogReadResolution(12);
 
   float VIN_Volt = get_vin_Volt();
   while (VIN_Volt <= UNDERVOLTAGE_THRES) {
     VIN_Volt = get_vin_Volt();
     delay(100);
-    Serial.printf("Waiting for power on, current voltage%.2f\n", VIN_Volt);
+    Serial.printf("Waiting for power on... Voltage: %.2f V\n", VIN_Volt);
   }
-  Serial.printf("Calibrating motor...Current voltage%.2f\n", VIN_Volt);
+  Serial.printf("Power rail OK: %.2f V\n", VIN_Volt);
 }
 
-// helper function for board_check
-float get_vin_Volt() {
-  float vin = analogRead(VIN_PIN);
-
-  vin = vin * 3.3 / 4095.0;
-  vin *= 8.5;  // voltage divider value on MKS board
-  return vin;
-  // return analogReadMilliVolts(VIN_PIN) * 8.5 / 1000;
+float get_vin_Volt() { 
+  return analogReadMilliVolts(13) * 8.5 / 1000.0; 
 }
 
-// making sure VIN voltage on board isn't overshooting
 void board_check() {
   uint32_t curr_millis = millis();
-  static uint8_t enableState = 0;
+  static uint8_t enableState = 1;
 
-  if (curr_millis - prev_millis_board >= 1000) {
+  if (curr_millis - prev_millis_board >= 500) {
     float vin_Volt = get_vin_Volt();
 
     if (vin_Volt < UNDERVOLTAGE_THRES) {
       flag_under_voltage = true;
-      enableState = 0;
-      uint8_t count = 5;
-      while (count--) {
-        float vin_Volt = get_vin_Volt();
-        if (vin_Volt > UNDERVOLTAGE_THRES) {
-          flag_under_voltage = false;
-          break;
-        }
-      }
-    } else {
-      flag_under_voltage = false;
-    }
-    if (flag_under_voltage) {
-      // motor.disable();
       motor1.disable();
-    } else if (0 == enableState && flag_under_voltage == false) {
+      enableState = 0;
+      Serial.printf("[SAFETY ALERT] Undervoltage detected: %.2f V\n", vin_Volt);
+    } else if (enableState == 0) {
+      flag_under_voltage = false;
       enableState = 1;
-      // motor.enable();
       motor1.enable();
     }
     prev_millis_board = curr_millis;
