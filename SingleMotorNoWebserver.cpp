@@ -28,7 +28,7 @@ void board_init();
 // ============================================================================
 // HARDWARE CURRENT LIMITS & SAFETY
 // ============================================================================
-const float FFB_CURRENT_LIMIT     = 4.80f; // [Amps] Safe continuous current ceiling (5A Driver limit)
+const float FFB_CURRENT_LIMIT     = 4.20f; // [Amps] Safe continuous current ceiling (5A Driver limit)
 
 // ============================================================================
 // PHASE 1: REEL-IN AT SPECIFIC CURRENT & STALL DETECTION (PURE TORQUE MODE)
