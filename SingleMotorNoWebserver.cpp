@@ -28,22 +28,22 @@ void board_init();
 // ============================================================================
 // HARDWARE CURRENT LIMITS & SAFETY
 // ============================================================================
-const float FFB_CURRENT_LIMIT     = 3.80f; // [Amps] Safe continuous current ceiling (5A Driver limit)
+const float FFB_CURRENT_LIMIT     = 4.80f; // [Amps] Safe continuous current ceiling (5A Driver limit)
 
 // ============================================================================
 // PHASE 1: REEL-IN AT SPECIFIC CURRENT & STALL DETECTION (PURE TORQUE MODE)
 // ============================================================================
-float REEL_IN_CURRENT           = 1.75f; // [Amps] Specific torque current used to pull handle home
-const float STALL_VEL_THRESHOLD = 2.5f;  // [rad/s] Velocity threshold confirming mechanical stop
-const uint32_t STALL_TIME_MS    = 250;   // [ms] Duration velocity must remain low to confirm home
+float REEL_IN_CURRENT           = 1.8f;  // [Amps] Specific torque current used to pull handle home
+const float STALL_VEL_THRESHOLD = 3.0f;  // [rad/s] Velocity threshold confirming mechanical stop
+const uint32_t STALL_TIME_MS    = 200;   // [ms] Duration velocity must remain low to confirm home
 
 // ============================================================================
-// PHASE 2: DYNAMIC TORQUE RESISTANCE TUNING (PURE TORQUE MODE)
+// PHASE 2: DYNAMIC TORQUE RESISTANCE TUNING (DIGRESSIVE / SLOW-GROWTH MODE)
 // ============================================================================
 float I_rest                      = 0.50f; // [Amps] Baseline tension at home stop
-float k_spring                    = 0.12f; // [Amps/rad] Linear current ramp per radian pulled
-float k_quad                      = 0.008f;// [Amps/rad^2] Subtle quadratic ramp for deep pulls
-float d_velocity                  = 0.08f; // [Amps/(rad/s)] Dynamic current added to resist movement
+float k_spring                    = 5.25f; // [Amps] Force scaling factor for pull displacement
+float k_exponent                  = 0.65f; // [< 1.0] Digressive curve: force increases slower as displacement grows
+float d_velocity                  = 0.08f; // [Amps/(rad/s)] Dynamic current added to resist speed
 
 // Working variables
 float current_angle1 = 0;
@@ -51,7 +51,7 @@ float spring_start_angle = 0;
 bool windMotor = false;
 uint32_t stall_timer = 0;
 uint32_t reel_print_timer = 0; // Timer for non-blocking serial outputs during reel-in
-uint32_t ffb_print_timer = 0;  // Timer for non-blocking serial outputs during FFB phase
+uint32_t ffb_print_timer = 0;  // Timer for non-blocking serial outputs during FFB mode
 
 bool flag_under_voltage = false;
 uint32_t prev_millis_board;
@@ -69,7 +69,7 @@ Commander command = Commander(Serial);
 void doMotor(char* cmd) { command.motor(&motor1, cmd); }
 void doReelCurrent(char* cmd) { command.scalar(&REEL_IN_CURRENT, cmd); }
 void doSpring(char* cmd) { command.scalar(&k_spring, cmd); }
-void doQuad(char* cmd) { command.scalar(&k_quad, cmd); }
+void doExponent(char* cmd) { command.scalar(&k_exponent, cmd); }
 void doDamp(char* cmd) { command.scalar(&d_velocity, cmd); }
 void doRest(char* cmd) { command.scalar(&I_rest, cmd); }
 
@@ -112,13 +112,16 @@ void setup() {
   motor1.torque_controller = TorqueControlType::foc_current;
   motor1.controller = MotionControlType::torque; // Permanent Pure Current Mode
 
-  // Inner Current Loop PID Tuning
-  motor1.PID_current_q.P = 0.35f;
-  motor1.PID_current_q.I = 15.0f;
-  motor1.PID_current_d.P = 0.35f;
-  motor1.PID_current_d.I = 15.0f;
-  motor1.LPF_current_q.Tf = 0.008f;
-  motor1.LPF_current_d.Tf = 0.008f;
+  // Inner Current Loop PID Tuning (Softened to reduce ESP32 ADC noise hunting)
+  motor1.PID_current_q.P = 0.08f;
+  motor1.PID_current_q.I = 2.0f;
+  motor1.PID_current_d.P = 0.08f;
+  motor1.PID_current_d.I = 2.0f;
+
+  // Filtering (Smoothes out current noise and AS5600 velocity jitter)
+  motor1.LPF_current_q.Tf = 0.03f; 
+  motor1.LPF_current_d.Tf = 0.03f;
+  motor1.LPF_velocity.Tf  = 0.020f; // Smoothes AS5600 velocity spikes
 
   // Driver & Voltage Boundaries
   motor1.voltage_limit = 9.00f;        // Voltage headroom for current loop
@@ -132,8 +135,8 @@ void setup() {
   // Serial commands for Live Tuning
   command.add('M', doMotor, "motor");
   command.add('W', doReelCurrent, "reel-in amperage (A)");
-  command.add('S', doSpring, "linear current ramp (A/rad)");
-  command.add('Q', doQuad, "quadratic ramp (A/rad^2)");
+  command.add('S', doSpring, "spring current gain (A)");
+  command.add('E', doExponent, "ramp exponent (<1.0 for slow taper)");
   command.add('D', doDamp, "velocity resistance (A/(rad/s))");
   command.add('I', doRest, "resting baseline current (A)");
 
@@ -156,14 +159,12 @@ void loop() {
     // Read current rotation speed
     float current_vel = fabs(sensor1.getVelocity());
 
-    // Print measured q-axis current and velocity threshold state every 200 ms during winding
+    // ONLY PRINT VELOCITY AND THRESHOLD STATUS DURING WINDING SCENARIO
     if (millis() - reel_print_timer >= 200) {
       reel_print_timer = millis();
-      float actual_iq = fabs(motor1.current.q);
-      
-      bool is_below_threshold = (current_vel < STALL_VEL_THRESHOLD);
-      Serial.printf("[WINDING] Current: %.2f A | Vel: %.2f rad/s | Threshold (%.2f rad/s) Reached? %s\n", 
-                    actual_iq, current_vel, STALL_VEL_THRESHOLD, is_below_threshold ? "YES (BELOW)" : "NO (ABOVE)");
+      bool threshold_met = (current_vel < STALL_VEL_THRESHOLD);
+      Serial.printf("[WINDING] Vel: %.2f rad/s | Threshold Met: %s\n", 
+                    current_vel, threshold_met ? "YES" : "NO");
     }
 
     // Check if the motor stopped spinning after hitting the end stop
@@ -175,7 +176,7 @@ void loop() {
         spring_start_angle = current_angle1;
         windMotor = true;
 
-        Serial.printf("\n>>> STALL DETECTED at hard stop! Final Measured Current: %.2f A <<<\n", fabs(motor1.current.q));
+        Serial.printf("\n>>> STALL DETECTED at hard stop! <<<\n");
         Serial.printf("Home position locked at %.2f rad. Dynamic FFB ACTIVE.\n\n", spring_start_angle);
       }
     } else {
@@ -183,7 +184,7 @@ void loop() {
     }
 
   // --------------------------------------------------------------------------
-  // PHASE 2: DYNAMIC FORCE FEEDBACK CURRENT CONTROL
+  // PHASE 2: DYNAMIC FORCE FEEDBACK CURRENT CONTROL (SLOW GROWING TORQUE)
   // --------------------------------------------------------------------------
   } else { 
     // Distance pulled away from home stop (positive when pulled out)
@@ -191,33 +192,30 @@ void loop() {
     
     // Line pull velocity (positive when pulling out)
     float velocity = sensor1.getVelocity();
-    float abs_velocity = fabs(velocity);
 
     float target_current = I_rest; // Start at baseline holding current
 
     if (displacement > 0.0f) {
-      // 1. Linear current ramp based on distance pulled
-      target_current += k_spring * displacement;
+      // Slow-growing torque curve using fractional power exponent (k_exponent < 1.0):
+      // Force increases progressively slower the further away the handle is pulled.
+      target_current += k_spring * powf(displacement, k_exponent);
 
-      // 2. Gentle quadratic current curve
-      target_current += k_quad * (displacement * displacement);
-
-      // 3. Dynamic current increase to resist speed/movement
+      // Dynamic current increase to resist speed/movement
       if (velocity > 0.0f) {
         target_current += d_velocity * velocity;
       }
     }
 
-    // Print velocity threshold status during Phase 2 every 200 ms
-    if (millis() - ffb_print_timer >= 200) {
-      ffb_print_timer = millis();
-      bool threshold_exceeded = (abs_velocity >= STALL_VEL_THRESHOLD);
-      Serial.printf("[FFB MODE] Vel: %.2f rad/s | Threshold (%.2f rad/s) Reached? %s\n",
-                    abs_velocity, STALL_VEL_THRESHOLD, threshold_exceeded ? "YES (EXCEEDED)" : "NO (BELOW)");
-    }
-
     // Safely clamp the current command within continuous threshold
     target_current = constrain(target_current, 0.0f, FFB_CURRENT_LIMIT);
+
+    // PRINT TARGET AND ACTUAL CURRENT PERIODICALLY IN FFB MODE (EVERY 200 MS)
+    if (millis() - ffb_print_timer >= 200) {
+      ffb_print_timer = millis();
+      float actual_current = fabs(motor1.current.q);
+      Serial.printf("[FFB MODE] Target Current: %.2f A | Actual Current: %.2f A\n", 
+                    target_current, actual_current);
+    }
 
     // Direct negative q-axis current command to pull back towards home
     motor1.move(-target_current);
