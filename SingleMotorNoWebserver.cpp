@@ -33,19 +33,21 @@ const float FFB_CURRENT_LIMIT     = 4.20f; // [Amps] Safe continuous current cei
 // ============================================================================
 // PHASE 1: REEL-IN AT SPECIFIC CURRENT & STALL DETECTION (PURE TORQUE MODE)
 // ============================================================================
-float REEL_IN_CURRENT           = 1.8f;  // [Amps] Specific torque current used to pull handle home
+float REEL_IN_CURRENT           = 1.75f;  // [Amps] Specific torque current used to pull handle home
 const float STALL_VEL_THRESHOLD = 3.0f;  // [rad/s] Velocity threshold confirming mechanical stop
 const uint32_t STALL_TIME_MS    = 200;   // [ms] Duration velocity must remain low to confirm home
 
 // ============================================================================
 // PHASE 2: DYNAMIC TORQUE RESISTANCE TUNING (DIGRESSIVE / SLOW-GROWTH MODE)
 // ============================================================================
-float I_rest                      = 0.50f; // [Amps] Baseline tension at home stop
-float k_spring                    = 5.25f; // [Amps] Force scaling factor for pull displacement
-float k_exponent                  = 0.65f; // [< 1.0] Digressive curve: force increases slower as displacement grows
+float I_rest                      = 0.00f; // [Amps] Additional baseline tension at home stop
+float k_spring                    = 5.25f; // [Amps] Force scaling factor (will be auto-calculated)
+float k_exponent                  = 0.85f; // [< 1.0] Digressive curve: force increases slower as displacement grows
 float d_velocity                  = 0.08f; // [Amps/(rad/s)] Dynamic current added to resist speed
 
 // Working variables
+float initial_angle = 0;       // Angle before reel-in begins
+float max_displacement = 0;    // Total travel distance calculated during reel-in
 float current_angle1 = 0;
 float spring_start_angle = 0;
 bool windMotor = false;
@@ -88,6 +90,7 @@ void setup() {
   // Setup AS5600 Encoder
   I2Ctwo.begin(23, 5, 400000UL); // Fast 400kHz I2C
   sensor1.init(&I2Ctwo);
+  sensor1.min_elapsed_time = 0.001f; // Prevents I2C delta-time jitter noise
   motor1.linkSensor(&sensor1);
 
   // Driver Setup
@@ -114,23 +117,26 @@ void setup() {
 
   // Inner Current Loop PID Tuning (Softened to reduce ESP32 ADC noise hunting)
   motor1.PID_current_q.P = 0.08f;
-  motor1.PID_current_q.I = 2.0f;
+  motor1.PID_current_q.I = 1.0f;
   motor1.PID_current_d.P = 0.08f;
-  motor1.PID_current_d.I = 2.0f;
+  motor1.PID_current_d.I = 1.0f;
 
   // Filtering (Smoothes out current noise and AS5600 velocity jitter)
-  motor1.LPF_current_q.Tf = 0.03f; 
+  motor1.LPF_current_q.Tf = 0.03f;
   motor1.LPF_current_d.Tf = 0.03f;
-  motor1.LPF_velocity.Tf  = 0.020f; // Smoothes AS5600 velocity spikes
+  motor1.LPF_velocity.Tf  = 0.050f; // Smoothes out AS5600 I2C standstill spikes
 
   // Driver & Voltage Boundaries
-  motor1.voltage_limit = 9.00f;        // Voltage headroom for current loop
+  motor1.voltage_limit = 12.00f;       // Raised headroom for current loop under load
   motor1.voltage_sensor_align = 0.35f; // Anti-brownout calibration limit
-  motor1.updateCurrentLimit(FFB_CURRENT_LIMIT); 
+  motor1.updateCurrentLimit(FFB_CURRENT_LIMIT);
   motor1.phase_resistance = 0.08f;
 
   motor1.init();
   motor1.initFOC();
+
+  // Record the unwound position immediately after FOC alignment
+  initial_angle = sensor1.getAngle();
 
   // Serial commands for Live Tuning
   command.add('M', doMotor, "motor");
@@ -163,7 +169,7 @@ void loop() {
     if (millis() - reel_print_timer >= 200) {
       reel_print_timer = millis();
       bool threshold_met = (current_vel < STALL_VEL_THRESHOLD);
-      Serial.printf("[WINDING] Vel: %.2f rad/s | Threshold Met: %s\n", 
+      Serial.printf("[WINDING] Vel: %.2f rad/s | Threshold Met: %s\n",
                     current_vel, threshold_met ? "YES" : "NO");
     }
 
@@ -176,8 +182,24 @@ void loop() {
         spring_start_angle = current_angle1;
         windMotor = true;
 
+        // Calculate total spool distance
+        max_displacement = fabs(initial_angle - spring_start_angle);
+
+        // We want to reach max force a little AFTER the physical end (extend travel boundary by +1.0 radian)
+        float extended_buffer = 1.0f;
+        float active_displacement = max_displacement + extended_buffer;
+
+        // Ensure we have enough travel distance to safely calculate the curve
+        if (active_displacement > 0.1f) {
+          k_spring = (FFB_CURRENT_LIMIT - REEL_IN_CURRENT - I_rest) / powf(active_displacement, k_exponent);
+        } else {
+          k_spring = 5.25f; 
+        }
+
         Serial.printf("\n>>> STALL DETECTED at hard stop! <<<\n");
-        Serial.printf("Home position locked at %.2f rad. Dynamic FFB ACTIVE.\n\n", spring_start_angle);
+        Serial.printf("Home position locked at %.2f rad. Total travel: %.2f rad\n", spring_start_angle, max_displacement);
+        Serial.printf("Auto-tuned k_spring to peak at FFB_CURRENT_LIMIT past full travel (target horizon: %.2f rad).\n", active_displacement);
+        Serial.printf("Dynamic FFB ACTIVE.\n\n");
       }
     } else {
       stall_timer = 0; // Still rotating, reset stall timer
@@ -186,19 +208,23 @@ void loop() {
   // --------------------------------------------------------------------------
   // PHASE 2: DYNAMIC FORCE FEEDBACK CURRENT CONTROL (SLOW GROWING TORQUE)
   // --------------------------------------------------------------------------
-  } else { 
+  } else {
     // Distance pulled away from home stop (positive when pulled out)
     float displacement = current_angle1 - spring_start_angle;
     
     // Line pull velocity (positive when pulling out)
     float velocity = sensor1.getVelocity();
 
-    float target_current = I_rest; // Start at baseline holding current
+    // Start target current at the 1.75A offset plus any optional baseline tension
+    float target_current = REEL_IN_CURRENT + I_rest; 
 
     if (displacement > 0.0f) {
-      // Slow-growing torque curve using fractional power exponent (k_exponent < 1.0):
-      // Force increases progressively slower the further away the handle is pulled.
-      target_current += k_spring * powf(displacement, k_exponent);
+      // Allow the math to calculate past the physical end stop up to the extended horizon (+1.0 rad)
+      float max_calc_displacement = fmax(0.1f, max_displacement + 1.0f);
+      float clamped_displacement = fmin(displacement, max_calc_displacement);
+
+      // Slow-growing torque curve using fractional power exponent, layered on top of the offset
+      target_current += k_spring * powf(clamped_displacement, k_exponent);
 
       // Dynamic current increase to resist speed/movement
       if (velocity > 0.0f) {
@@ -206,14 +232,14 @@ void loop() {
       }
     }
 
-    // Safely clamp the current command within continuous threshold
+    // Safely clamp the final command within continuous threshold
     target_current = constrain(target_current, 0.0f, FFB_CURRENT_LIMIT);
 
     // PRINT TARGET AND ACTUAL CURRENT PERIODICALLY IN FFB MODE (EVERY 200 MS)
     if (millis() - ffb_print_timer >= 200) {
       ffb_print_timer = millis();
       float actual_current = fabs(motor1.current.q);
-      Serial.printf("[FFB MODE] Target Current: %.2f A | Actual Current: %.2f A\n", 
+      Serial.printf("[FFB MODE] Target Current: %.2f A | Actual Current: %.2f A\n",
                     target_current, actual_current);
     }
 
@@ -238,8 +264,8 @@ void board_init() {
   Serial.printf("Power rail OK: %.2f V\n", VIN_Volt);
 }
 
-float get_vin_Volt() { 
-  return analogReadMilliVolts(13) * 8.5 / 1000.0; 
+float get_vin_Volt() {
+  return analogReadMilliVolts(13) * 8.5 / 1000.0;
 }
 
 void board_check() {
